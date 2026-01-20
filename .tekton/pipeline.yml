@@ -1,0 +1,117 @@
+
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: ci-cd-pipeline
+  namespace: sn-labs-fbi1
+spec:
+  params:
+    - name: git-url
+      type: string
+      default: https://github.com/fbi-bb/ci-cd-final-project.git
+    - name: git-revision
+      type: string
+      default: main
+
+    # >>> IMPORTANTE: estes dois são os que você vai referenciar no deploy e no build
+    - name: app-name
+      type: string
+      default: ci-cd-pipeline
+    - name: build-image
+      type: string
+      default: image-registry.openshift-image-registry.svc:5000/sn-labs-fbi1/ci-cd-pipeline:latest
+
+  workspaces:
+    - name: output
+
+  tasks:
+    - name: cleanup
+      taskRef:
+        kind: Task
+        name: cleanup
+      workspaces:
+        - name: output
+          workspace: output
+
+    - name: git-clone
+      runAfter: [cleanup]
+      taskRef:
+        kind: ClusterTask
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: deleteExisting
+          value: "true"
+        - name: depth
+          value: "0"
+        - name: sslVerify
+          value: "true"
+        - name: verbose
+          value: "true"
+      workspaces:
+        # Se sua ClusterTask de git-clone usa 'source' em vez de 'output', troque o 'name' abaixo para 'source'
+        - name: output
+          workspace: output
+
+    - name: eslint
+      runAfter: [git-clone]
+      taskRef:
+        kind: Task
+        name: eslint
+      params:
+        - name: workingDir
+          value: $(workspaces.output.path)
+        - name: extraArgs
+          value: "--max-warnings=0"
+      workspaces:
+        - name: output
+          workspace: output
+
+    - name: jest
+      runAfter: [eslint]
+      taskRef:
+        kind: Task
+        name: jest-test
+      params:
+        - name: workingDir
+          value: $(workspaces.output.path)
+        - name: script
+          value: "npm test -- --ci"
+      workspaces:
+        - name: output
+          workspace: output
+
+    - name: buildah
+      runAfter: [jest]
+      taskRef:
+        kind: ClusterTask
+        name: buildah
+      params:
+        # Use o MESMO valor do param 'build-image' (para manter consistência)
+        - name: IMAGE
+          value: $(params.build-image)
+        - name: DOCKERFILE
+          value: ./Dockerfile
+        # A maioria das ClusterTasks 'buildah' usam workspace 'source'; por isso, referenciamos $(workspaces.source.path) e mapeamos source → output no bloco 'workspaces'
+        - name: CONTEXT
+          value: $(workspaces.source.path)
+        - name: TLSVERIFY
+          value: "false"
+        - name: FORMAT
+          value: docker
+      workspaces:
+        - name: source    # se a sua buildah usa 'workspace' com outro nome, ajuste aqui
+          workspace: output
+
+    - name: deploy
+      runAfter: [buildah]
+      taskRef:
+        kind: ClusterTask
+        name: openshift-client
+      params:
+        # >>> NÃO QUEBRE LINHA, deixe o SCRIPT em uma ÚNICA linha:
+        - name: SCRIPT
+          value: oc create deployment $(params.app-name) --image=$(params.build-image) --dry-run=client -o yaml | oc apply -f -
